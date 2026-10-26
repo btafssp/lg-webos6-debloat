@@ -1,0 +1,76 @@
+#!/bin/sh
+# 60-debloat: stop LG's ad/ACR engine, a few unused telemetry/feature
+# daemons, and the built-in far-field microphone on a rooted LG C1
+# (webOS 6.5.3). Homebrew Channel init.d hook.
+#
+# HOW TO UNDO: delete this file and reboot the TV:
+#   rm /var/lib/webosbrew/init.d/60-debloat && reboot
+# (Nothing on disk is changed; /usr is read-only. Everything here is undone
+#  by a reboot once this file is gone.)
+#
+# Technique (same approach as own-your-glass): /etc is read-only so units
+# can't be masked. Instead, every boot:
+#   - systemd units: systemctl stop, then kill any leftover process.
+#   - luna (LS2) "dynamic" services that ls-hubd respawns on demand:
+#     bind-mount /dev/null over the binary so a respawn just fails.
+# Idempotent: safe to run again at any time. Log: /tmp/debloat.log
+#
+# Deliberately NOT touched: voice (alwaysready, com.webos.app.voice,
+# nlpmanager, performer), ThinQ / LG account (lg.thinqai.adapter,
+# ai-inference-manager, iot-client, pushclient, iconnectivity), discovery and
+# casting (avahi, airplay, cast, DIAL, DLNA), sdx, ss.gateway, ssap/xinetd,
+# firmware-update settings, network/DNS.
+
+# systemd units to stop (the unit's process is killed too)
+UNITS="contentminer remotediag dmost rdxd uploadd"
+# binaries to neutralise (LS2 Type=dynamic: ls-hubd would respawn them)
+#   acr2               = com.webos.service.acr (automatic content recognition)
+#   adoverlay-service  = com.webos.service.adoverlay (ad overlays)
+#   uploadd            = com.palm.uploadd (log/telemetry uploads)
+#   sportsalarm        = com.webos.service.sportsalarm
+#   amazon-alexa-adapter (Alexa is not used)
+BINS="/usr/sbin/acr2 /usr/sbin/adoverlay-service /usr/sbin/uploadd /usr/sbin/sportsalarm /usr/sbin/amazon-alexa-adapter"
+
+LOG=/tmp/debloat.log
+log() { echo "$(date '+%F %T') $*" >>"$LOG"; }
+
+killproc() {
+  pids=$(pidof "$1" 2>/dev/null)
+  [ -z "$pids" ] && return 0
+  kill -TERM $pids 2>/dev/null; sleep 1
+  pids=$(pidof "$1" 2>/dev/null)
+  [ -n "$pids" ] && kill -KILL $pids 2>/dev/null
+  if [ -n "$(pidof "$1" 2>/dev/null)" ]; then log "ERROR $1 still running"; else log "killed $1"; fi
+}
+
+apply() {
+  log "apply start"
+  for u in $UNITS; do
+    if systemctl is-active -q "$u.service" 2>/dev/null; then
+      systemctl stop "$u.service" 2>>"$LOG" && log "stopped unit $u" || log "ERROR stopping unit $u"
+    fi
+  done
+  for b in $BINS; do
+    [ -e "$b" ] || { log "absent $b"; continue; }
+    if ! grep -q " $b " /proc/mounts; then
+      mount --bind /dev/null "$b" 2>>"$LOG" && log "neutralised $b" || log "ERROR bind $b"
+    fi
+    killproc "${b##*/}"
+  done
+  for u in $UNITS; do killproc "$u"; done
+  # Built-in far-field mic (ALSA card 1 "WoV PDM Mic"). The Magic Remote mic
+  # does not use this device. Undo: delete these lines, reboot.
+  m=/dev/snd/pcmC1D0c
+  if [ -e $m ] && ! grep -q " $m " /proc/mounts; then
+    chmod 000 $m; mount --bind /dev/null $m 2>>"$LOG" && log "locked mic $m" || log "ERROR lock mic $m"
+  fi
+  log "apply done"
+}
+
+if [ "$1" = "now" ]; then
+  apply
+else
+  # At boot: run in the background so startup is never delayed; apply
+  # after the TV has settled, then once more to catch late starters.
+  ( sleep 60; apply; sleep 120; apply ) </dev/null >/dev/null 2>&1 &
+fi
